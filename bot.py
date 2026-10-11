@@ -749,6 +749,30 @@ async def ask_console(prompt: str) -> str:
     return (await asyncio.to_thread(input, "> ")).strip()
 
 
+def normalize_phone(raw: str) -> str:
+    text = (raw or "").strip()
+    digits = re.sub(r"\D", "", text)
+    if text.startswith("+") and 10 <= len(digits) <= 15:
+        return "+" + digits
+    if len(digits) == 11 and digits.startswith("8"):
+        return "+7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+7" + digits
+    return ""
+
+
+def wipe_session(session_path: str):
+    for suffix in (".session", ".session-journal"):
+        path = session_path + suffix
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 async def console_login(message: Message, telegram_id: int):
     if console_login_lock.locked():
         await message.answer("В консоли уже идёт другой вход. Дождитесь его окончания.")
@@ -761,18 +785,55 @@ async def console_login(message: Message, telegram_id: int):
             client = TelegramClient(session_path, API_ID, API_HASH)
             try:
                 await client.connect()
-                if not await client.is_user_authorized():
+                if await client.is_user_authorized():
+                    me = await client.get_me()
+                else:
+                    await close_client(client)
+                    wipe_session(session_path)
+                    client = TelegramClient(session_path, API_ID, API_HASH)
+                    await client.connect()
                     print(f"\n=== Вход менеджера {telegram_id} ===", flush=True)
                     print("Код в чат бота не отправлять. Вводить только в это окно.", flush=True)
-                    await client.start(
-                        phone=lambda: ask_console(
+                    phone = ""
+                    while not phone:
+                        entered = await ask_console(
                             f"Менеджер {telegram_id}. Номер, например +79001234567:"
-                        ),
-                        code_callback=lambda: ask_console("Код из официального Telegram:"),
-                        password=lambda: ask_console("Пароль 2FA. Если его нет, просто Enter:"),
-                    )
+                        )
+                        phone = normalize_phone(entered)
+                        if not phone:
+                            print(
+                                "Номер не принят. Нужен формат +79810830864. Введите ещё раз.",
+                                flush=True,
+                            )
+                    try:
+                        await client.send_code_request(phone)
+                    except errors.FloodWaitError as error:
+                        await message.answer(
+                            f"Telegram пока не шлёт новый код. Подождите {error.seconds} сек. и нажмите «Подключить Telegram»."
+                        )
+                        await close_client(client)
+                        wipe_session(session_path)
+                        return
+                    print("Код отправлен в приложение Telegram и, если привязана, на почту.", flush=True)
+                    while True:
+                        code = await ask_console("Код из официального Telegram:")
+                        if not code:
+                            print("Код пустой. Введите пять цифр ещё раз.", flush=True)
+                            continue
+                        try:
+                            await client.sign_in(phone=phone, code=code)
+                            break
+                        except errors.SessionPasswordNeededError:
+                            password = await ask_console("Пароль 2FA. Если его нет, просто Enter:")
+                            await client.sign_in(password=password)
+                            break
+                        except errors.PhoneCodeInvalidError:
+                            print("Неверный код. Введите его ещё раз. Новый код сам не придёт.", flush=True)
+                        except errors.PhoneCodeExpiredError:
+                            print("Код истёк. Запрашиваю новый.", flush=True)
+                            await client.send_code_request(phone)
+                    me = await client.get_me()
 
-                me = await client.get_me()
                 pending_clients[telegram_id] = {
                     "client": client,
                     "session_path": session_path,
@@ -782,11 +843,21 @@ async def console_login(message: Message, telegram_id: int):
                 }
                 await finish_connection(message, None, telegram_id)
             except Exception as error:
+                authorized = False
                 try:
-                    await client.disconnect()
+                    authorized = await client.is_user_authorized()
+                except Exception:
+                    authorized = False
+                try:
+                    await close_client(client)
                 except Exception:
                     pass
-                await message.answer(f"Вход не удался.\n\n{error}")
+                if not authorized:
+                    wipe_session(session_path)
+                await message.answer(
+                    "Вход не удался. Можно сразу нажать «Подключить Telegram» ещё раз.\n\n"
+                    f"{error}"
+                )
 
 
 @dp.message(F.text == "Подключить Telegram")
@@ -802,9 +873,10 @@ async def connect_start(message: Message):
         return
 
     await message.answer(
-        "Вход открыт в чёрном окне, где запущен бот.\n"
-        "Номер, код и пароль 2FA вводите туда.\n"
-        "В этот чат код не отправляйте.",
+        "Вход открыт в чёрном окне.\n"
+        "Регистрация менеджера уже есть, номер спрашиваем заново.\n"
+        "Номер можно ввести и без плюса: 79810830864 станет +79810830864.\n"
+        "Код в этот чат не отправляйте.",
         reply_markup=manager_keyboard(),
     )
     asyncio.create_task(console_login(message, message.from_user.id))
