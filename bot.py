@@ -42,6 +42,15 @@ dp = Dispatcher()
 pending_clients = {}
 publishing_lock = asyncio.Lock()
 console_login_lock = asyncio.Lock()
+session_lock = asyncio.Lock()
+
+
+def session_busy() -> bool:
+    return (
+        session_lock.locked()
+        or publishing_lock.locked()
+        or console_login_lock.locked()
+    )
 
 
 def encrypt_value(value: str) -> str:
@@ -516,8 +525,8 @@ async def search_start(message: Message, state: FSMContext):
     if not account or not account[8]:
         await message.answer("Сначала подключите Telegram-аккаунт.")
         return
-    if publishing_lock.locked():
-        await message.answer("Сейчас идёт рассылка. Поиск после неё.")
+    if session_busy():
+        await message.answer("Подожди, предыдущая команда ещё работает.")
         return
     await state.set_state(SearchStates.query)
     await message.answer(
@@ -545,7 +554,8 @@ async def search_query(message: Message, state: FSMContext):
 
     await message.answer("Ищу открытые чаты...")
     try:
-        found = await search_public_chats(account, query)
+        async with session_lock:
+            found = await search_public_chats(account, query)
     except Exception as error:
         await state.clear()
         await message.answer(
@@ -745,37 +755,38 @@ async def console_login(message: Message, telegram_id: int):
         return
 
     async with console_login_lock:
-        os.makedirs(SESSION_DIR, exist_ok=True)
-        session_path = os.path.join(SESSION_DIR, f"manager_{telegram_id}")
-        client = TelegramClient(session_path, API_ID, API_HASH)
-        try:
-            await client.connect()
-            if not await client.is_user_authorized():
-                print(f"\n=== Вход менеджера {telegram_id} ===", flush=True)
-                print("Код в чат бота не отправлять. Вводить только в это окно.", flush=True)
-                await client.start(
-                    phone=lambda: ask_console(
-                        f"Менеджер {telegram_id}. Номер, например +79001234567:"
-                    ),
-                    code_callback=lambda: ask_console("Код из официального Telegram:"),
-                    password=lambda: ask_console("Пароль 2FA. Если его нет, просто Enter:"),
-                )
-
-            me = await client.get_me()
-            pending_clients[telegram_id] = {
-                "client": client,
-                "session_path": session_path,
-                "api_id": API_ID,
-                "api_hash": API_HASH,
-                "phone": getattr(me, "phone", None) or "",
-            }
-            await finish_connection(message, None, telegram_id)
-        except Exception as error:
+        async with session_lock:
+            os.makedirs(SESSION_DIR, exist_ok=True)
+            session_path = os.path.join(SESSION_DIR, f"manager_{telegram_id}")
+            client = TelegramClient(session_path, API_ID, API_HASH)
             try:
-                await client.disconnect()
-            except Exception:
-                pass
-            await message.answer(f"Вход не удался.\n\n{error}")
+                await client.connect()
+                if not await client.is_user_authorized():
+                    print(f"\n=== Вход менеджера {telegram_id} ===", flush=True)
+                    print("Код в чат бота не отправлять. Вводить только в это окно.", flush=True)
+                    await client.start(
+                        phone=lambda: ask_console(
+                            f"Менеджер {telegram_id}. Номер, например +79001234567:"
+                        ),
+                        code_callback=lambda: ask_console("Код из официального Telegram:"),
+                        password=lambda: ask_console("Пароль 2FA. Если его нет, просто Enter:"),
+                    )
+
+                me = await client.get_me()
+                pending_clients[telegram_id] = {
+                    "client": client,
+                    "session_path": session_path,
+                    "api_id": API_ID,
+                    "api_hash": API_HASH,
+                    "phone": getattr(me, "phone", None) or "",
+                }
+                await finish_connection(message, None, telegram_id)
+            except Exception as error:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                await message.answer(f"Вход не удался.\n\n{error}")
 
 
 @dp.message(F.text == "Подключить Telegram")
@@ -785,6 +796,9 @@ async def connect_start(message: Message):
         return
     if not API_ID or not API_HASH:
         await message.answer("В файле .env нет API_ID или API_HASH.")
+        return
+    if session_busy():
+        await message.answer("Подожди, предыдущая команда ещё работает.")
         return
 
     await message.answer(
@@ -855,9 +869,13 @@ async def refresh_groups_handler(message: Message):
     if not account or not account[8]:
         await message.answer("Telegram-аккаунт ещё не подключён.")
         return
+    if session_busy():
+        await message.answer("Подожди, предыдущая команда ещё работает.")
+        return
     await message.answer("Обновляю список групп...")
     try:
-        count = await refresh_groups(account[0])
+        async with session_lock:
+            count = await refresh_groups(account[0])
     except Exception as error:
         await message.answer(f"Не удалось обновить группы.\n\n{error}")
         return
@@ -1066,11 +1084,12 @@ async def confirm_publish(message: Message, state: FSMContext):
     if not account:
         await message.answer("Аккаунт не найден.")
         return
-    if publishing_lock.locked():
-        await message.answer("Сейчас уже идёт другая рассылка.")
+    if session_busy():
+        await message.answer("Подожди, предыдущая команда ещё работает.")
         return
     async with publishing_lock:
-        await run_publishing(message, account, delay=10)
+        async with session_lock:
+            await run_publishing(message, account, delay=10)
 
 
 @dp.message(PublishStates.confirm)
