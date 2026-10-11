@@ -489,7 +489,9 @@ async def search_public_chats(account, query: str, limit: int = 20):
             continue
         seen.add(key)
         if isinstance(chat, Channel):
-            kind = "канал" if chat.broadcast else "группа"
+            if chat.broadcast or not chat.megagroup:
+                continue
+            kind = "группа"
         else:
             kind = "чат"
         found.append((kind, title, username))
@@ -519,8 +521,8 @@ async def search_start(message: Message, state: FSMContext):
         return
     await state.set_state(SearchStates.query)
     await message.answer(
-        "Напиши, что искать. Например: подработка Саранск\n"
-        "Бот только покажет открытые чаты и никуда не вступит.",
+        "Напиши, что искать. Например: чат Саранск подработка\n"
+        "Каналы не показываю: туда нельзя писать. Бот никуда не вступает.",
         reply_markup=cancel_keyboard(),
     )
 
@@ -561,7 +563,7 @@ async def search_query(message: Message, state: FSMContext):
         return
     if not found:
         await message.answer(
-            "Ничего не найдено. Попробуй другие слова.",
+            "Ничего не найдено. По этому слову Telegram отдал только каналы, либо пусто. Добавь слово «чат» или «подработка».",
             reply_markup=manager_keyboard(),
         )
         return
