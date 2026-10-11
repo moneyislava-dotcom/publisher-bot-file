@@ -81,6 +81,10 @@ class SearchStates(StatesGroup):
     query = State()
 
 
+class AdminStates(StatesGroup):
+    delete_manager = State()
+
+
 async def init_db():
     async with db_connect() as db:
         await db.execute("PRAGMA busy_timeout = 30000")
@@ -289,7 +293,8 @@ def admin_keyboard():
             [
                 KeyboardButton(text="Менеджеры"),
                 KeyboardButton(text="Статистика"),
-            ]
+            ],
+            [KeyboardButton(text="Удалить менеджера")],
         ],
         resize_keyboard=True,
     )
@@ -1268,6 +1273,93 @@ async def admin_managers(message: Message):
             f"   Групп: {groups_count}\n\n"
         )
     await message.answer(text)
+
+
+@dp.message(F.text == "Удалить менеджера")
+async def admin_delete_start(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user or user[4] != "admin":
+        return
+
+    async with db_connect() as db:
+        cursor = await db.execute(
+            """
+            SELECT u.id, u.telegram_id, u.first_name, u.username
+            FROM users u
+            WHERE u.role = 'manager'
+            ORDER BY u.id
+            """
+        )
+        rows = await cursor.fetchall()
+
+    if not rows:
+        await message.answer("Менеджеров нет.")
+        return
+
+    await state.set_state(AdminStates.delete_manager)
+    await state.update_data(delete_ids=[row[0] for row in rows])
+    text = "Напиши номер менеджера, которого удалить.\n\n"
+    for index, (_, _, first_name, username) in enumerate(rows, 1):
+        label = f"@{username}" if username else "без username"
+        text += f"{index}. {first_name or 'Без имени'} ({label})\n"
+    text += "\nОтмена — кнопка внизу."
+    await message.answer(text, reply_markup=cancel_keyboard())
+
+
+@dp.message(AdminStates.delete_manager, F.text != "Отмена")
+async def admin_delete_choose(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user or user[4] != "admin":
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    ids = data.get("delete_ids") or []
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= len(ids)):
+        await message.answer(f"Нужен номер от 1 до {len(ids)}.")
+        return
+
+    user_id = ids[int(raw) - 1]
+    async with db_connect() as db:
+        cursor = await db.execute(
+            """
+            SELECT u.first_name, u.telegram_id, a.session_path
+            FROM users u
+            LEFT JOIN telegram_accounts a ON a.user_id = u.id
+            WHERE u.id = ? AND u.role = 'manager'
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await state.clear()
+            await message.answer("Менеджер уже удалён.", reply_markup=admin_keyboard())
+            return
+        first_name, telegram_id, session_path = row
+        await db.execute(
+            """
+            DELETE FROM groups
+            WHERE account_id IN (
+                SELECT id FROM telegram_accounts WHERE user_id = ?
+            )
+            """,
+            (user_id,),
+        )
+        await db.execute("DELETE FROM telegram_accounts WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM users WHERE id = ? AND role = 'manager'", (user_id,))
+        await db.commit()
+
+    if session_path:
+        wipe_session(session_path)
+    if telegram_id:
+        await drop_pending(telegram_id)
+
+    await state.clear()
+    await message.answer(
+        f"Менеджер «{first_name or 'Без имени'}» удалён.",
+        reply_markup=admin_keyboard(),
+    )
 
 
 @dp.message(F.text == "Статистика")
