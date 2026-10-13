@@ -21,8 +21,10 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH") or ""
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
 DB_PATH = "publisher.db"
 SESSION_DIR = "sessions"
+REPORTS_DIR = "reports"
 KEY_FILE = "telegram_secret.key"
 MESSAGES_FILE = "messages.txt"
 
@@ -40,17 +42,21 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 pending_clients = {}
-publishing_lock = asyncio.Lock()
+account_locks = {}
 console_login_lock = asyncio.Lock()
 session_lock = asyncio.Lock()
 
 
+def lock_for(account_id: int) -> asyncio.Lock:
+    lock = account_locks.get(account_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        account_locks[account_id] = lock
+    return lock
+
+
 def session_busy() -> bool:
-    return (
-        session_lock.locked()
-        or publishing_lock.locked()
-        or console_login_lock.locked()
-    )
+    return session_lock.locked() or console_login_lock.locked()
 
 
 def encrypt_value(value: str) -> str:
@@ -603,7 +609,7 @@ async def search_query(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=manager_keyboard())
 
 
-async def run_publishing(message: Message, account, delay: int = 10):
+async def run_publishing(message: Message, account, manager_telegram_id: int, delay: int = 10):
     account_id = account[0]
     api_id = account[2]
     encrypted_hash = account[3]
@@ -659,23 +665,27 @@ async def run_publishing(message: Message, account, delay: int = 10):
     )
 
     sent = blocked = slowmode = flood = errors_count = 0
+    ok_lines = []
+    fail_lines = []
     for idx, (tg_id, title, _) in enumerate(sendable, 1):
         try:
             await client.send_message(tg_id, text)
             await update_group_status(account_id, tg_id, "SENT")
             sent += 1
-            mark = "OK"
+            ok_lines.append(title)
         except errors.FloodWaitError as e:
             await update_group_status(account_id, tg_id, "FLOOD_WAIT", f"{e.seconds} sec")
             flood += 1
+            fail_lines.append(f"{title} — FLOOD_WAIT {e.seconds} сек")
             await message.answer(
-                f"FLOOD_WAIT {e.seconds} сек. Рассылка остановлена на группе: {title}"
+                f"Не прошло: {title}\nFLOOD_WAIT {e.seconds} сек. Рассылка остановлена."
             )
             break
         except errors.SlowModeWaitError as e:
             await update_group_status(account_id, tg_id, "SLOWMODE_WAIT", f"{e.seconds} sec")
             slowmode += 1
-            mark = "SLOW"
+            fail_lines.append(f"{title} — SLOWMODE {e.seconds} сек")
+            await message.answer(f"Не прошло: {title}\nSlow Mode {e.seconds} сек.")
         except Exception as e:
             err = str(e)
             banned = any(
@@ -690,65 +700,82 @@ async def run_publishing(message: Message, account, delay: int = 10):
             if banned:
                 await update_group_status(account_id, tg_id, "BLOCKED", err)
                 blocked += 1
-                mark = "BLOCKED"
+                fail_lines.append(f"{title} — BLOCKED")
+                await message.answer(f"Не прошло: {title}\nЗаблокировано.")
             else:
                 await update_group_status(account_id, tg_id, "ERROR", err)
                 errors_count += 1
-                mark = "ERROR"
-
-        if idx % 5 == 0 or idx == len(sendable):
-            await message.answer(f"[{idx}/{len(sendable)}] {mark} {title}")
+                fail_lines.append(f"{title} — ERROR")
+                await message.answer(f"Не прошло: {title}\nОшибка.")
 
         if idx < len(sendable):
             await asyncio.sleep(delay)
 
     await client.disconnect()
-    saved = await export_sent_groups(account_id)
-    await message.answer(
+    summary = (
         "Рассылка завершена.\n"
         f"Успешно: {sent}\n"
         f"Заблокировано: {blocked}\n"
         f"Slow Mode: {slowmode}\n"
         f"Flood Wait: {flood}\n"
-        f"Ошибки: {errors_count}\n"
-        f"Список успешных: sent_groups_{account_id}.txt ({saved})",
+        f"Ошибки: {errors_count}"
+    )
+    report_path = save_manager_report(manager_telegram_id, summary, ok_lines, fail_lines)
+    await message.answer(
+        summary + f"\nОтчёт: {report_path}",
         reply_markup=manager_keyboard(),
     )
+
+
+def save_manager_report(telegram_id: int, summary: str, ok_lines, fail_lines) -> str:
+    folder = os.path.join(REPORTS_DIR, f"manager_{telegram_id}")
+    os.makedirs(folder, exist_ok=True)
+    name = datetime.now().strftime("%Y-%m-%d_%H-%M") + ".txt"
+    path = os.path.join(folder, name)
+    lines = [summary, "", "Успешно:"]
+    lines.extend(f"{i}. {title}" for i, title in enumerate(ok_lines, 1))
+    if not ok_lines:
+        lines.append("нет")
+    lines.extend(["", "Не прошло:"])
+    lines.extend(f"{i}. {line}" for i, line in enumerate(fail_lines, 1))
+    if not fail_lines:
+        lines.append("нет")
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("\n".join(lines) + "\n")
+    return path
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
+    role = "admin" if ADMIN_ID and message.from_user.id == ADMIN_ID else "manager"
     existing = await get_user(message.from_user.id)
     if existing:
-        if existing[4] == "admin":
-            await message.answer(
-                "Вы уже зарегистрированы как администратор.",
-                reply_markup=admin_keyboard(),
-            )
-        else:
-            await message.answer(
-                "Вы уже зарегистрированы как менеджер.",
-                reply_markup=manager_keyboard(),
-            )
+        if existing[4] != role:
+            async with db_connect() as db:
+                await db.execute(
+                    "UPDATE users SET role = ? WHERE telegram_id = ?",
+                    (role, message.from_user.id),
+                )
+                await db.commit()
+        keyboard = admin_keyboard() if role == "admin" else manager_keyboard()
+        title = "Вы администратор." if role == "admin" else "Вы менеджер."
+        await message.answer(
+            f"{title}\nВаш id: {message.from_user.id}",
+            reply_markup=keyboard,
+        )
         return
 
-    async with db_connect() as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM users")
-        total = (await cursor.fetchone())[0]
-
-    if total == 0:
-        await create_user(message, "admin")
-        await message.answer(
-            "Вы стали администратором. Это первый пользователь системы.",
-            reply_markup=admin_keyboard(),
-        )
+    await create_user(message, role)
+    keyboard = admin_keyboard() if role == "admin" else manager_keyboard()
+    if role == "admin":
+        text = f"Вы администратор.\nВаш id: {message.from_user.id}"
     else:
-        await create_user(message, "manager")
-        await message.answer(
-            "Вы зарегистрированы как менеджер. Начните с подключения Telegram-аккаунта.",
-            reply_markup=manager_keyboard(),
+        text = (
+            f"Вы менеджер.\nВаш id: {message.from_user.id}\n"
+            "Подключите Telegram-аккаунт один раз, потом жмите «Запустить рассылку»."
         )
+    await message.answer(text, reply_markup=keyboard)
 
 
 @dp.message(F.text == "Отмена")
@@ -1207,12 +1234,11 @@ async def confirm_publish(message: Message, state: FSMContext):
     if not account:
         await message.answer("Аккаунт не найден.")
         return
-    if session_busy():
-        await message.answer("Подожди, предыдущая команда ещё работает.")
+    if lock_for(account[0]).locked():
+        await message.answer("У этого аккаунта уже идёт рассылка. Дождись окончания.")
         return
-    async with publishing_lock:
-        async with session_lock:
-            await run_publishing(message, account, delay=10)
+    async with lock_for(account[0]):
+        await run_publishing(message, account, message.from_user.id, delay=10)
 
 
 @dp.message(PublishStates.confirm)
@@ -1441,10 +1467,13 @@ async def admin_statistics(message: Message):
 
 async def main():
     os.makedirs(SESSION_DIR, exist_ok=True)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
     await init_db()
     print("Админ-бот запущен")
     print("База:", DB_PATH)
     print("Сессии:", SESSION_DIR)
+    print("Отчёты:", REPORTS_DIR)
+    print("ADMIN_ID:", ADMIN_ID or "не задан")
     await dp.start_polling(bot)
 
 
