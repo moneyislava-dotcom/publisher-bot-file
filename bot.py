@@ -270,16 +270,17 @@ def manager_keyboard():
         keyboard=[
             [
                 KeyboardButton(text="Подключить Telegram"),
+                KeyboardButton(text="Войти заново"),
+            ],
+            [
                 KeyboardButton(text="Обновить группы"),
-            ],
-            [
                 KeyboardButton(text="Мои группы"),
-                KeyboardButton(text="Успешные группы"),
             ],
             [
+                KeyboardButton(text="Успешные группы"),
                 KeyboardButton(text="Моя статистика"),
-                KeyboardButton(text="Есть ответ"),
             ],
+            [KeyboardButton(text="Есть ответ")],
             [KeyboardButton(text="Найти чаты")],
             [KeyboardButton(text="Запустить рассылку")],
         ],
@@ -778,7 +779,7 @@ def wipe_session(session_path: str):
                 pass
 
 
-async def console_login(message: Message, telegram_id: int):
+async def console_login(message: Message, telegram_id: int, force: bool = False):
     if console_login_lock.locked():
         await message.answer("В консоли уже идёт другой вход. Дождитесь его окончания.")
         return
@@ -790,6 +791,19 @@ async def console_login(message: Message, telegram_id: int):
             client = TelegramClient(session_path, API_ID, API_HASH)
             try:
                 await client.connect()
+                if force:
+                    await close_client(client)
+                    wipe_session(session_path)
+                    db_user = await get_user(telegram_id)
+                    if db_user:
+                        async with db_connect() as db:
+                            await db.execute(
+                                "UPDATE telegram_accounts SET connected = 0 WHERE user_id = ?",
+                                (db_user[0],),
+                            )
+                            await db.commit()
+                    client = TelegramClient(session_path, API_ID, API_HASH)
+                    await client.connect()
                 if await client.is_user_authorized():
                     me = await client.get_me()
                 else:
@@ -885,6 +899,27 @@ async def connect_start(message: Message):
         reply_markup=manager_keyboard(),
     )
     asyncio.create_task(console_login(message, message.from_user.id))
+
+
+@dp.message(F.text == "Войти заново")
+async def reconnect_start(message: Message):
+    user = await get_user(message.from_user.id)
+    if not user or user[4] != "manager":
+        return
+    if not API_ID or not API_HASH:
+        await message.answer("В файле .env нет API_ID или API_HASH.")
+        return
+    if session_busy():
+        await message.answer("Подожди, предыдущая команда ещё работает.")
+        return
+
+    await message.answer(
+        "Старый вход этого менеджера сброшен.\n"
+        "Номер вводи в чёрном окне, не в этот чат.\n"
+        "Код тоже только туда.",
+        reply_markup=manager_keyboard(),
+    )
+    asyncio.create_task(console_login(message, message.from_user.id, force=True))
 
 
 async def finish_connection(message, state, telegram_id):
