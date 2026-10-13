@@ -320,6 +320,11 @@ def confirm_keyboard():
     )
 
 
+def personalize_text(text: str, username: str, first_name: str) -> str:
+    contact = f"@{username}" if username else (first_name or "мне в личные сообщения")
+    return re.sub(r"@jobrossi", contact, text, flags=re.IGNORECASE)
+
+
 def load_messages():
     try:
         with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
@@ -611,7 +616,7 @@ async def run_publishing(message: Message, account, delay: int = 10):
         return
 
     variant_no = random.randrange(len(messages_list))
-    text = messages_list[variant_no]
+    raw_text = messages_list[variant_no]
 
     async with db_connect() as db:
         cursor = await db.execute(
@@ -634,19 +639,24 @@ async def run_publishing(message: Message, account, delay: int = 10):
         )
         return
 
-    await message.answer(
-        f"Рассылка запущена.\n"
-        f"Групп: {len(sendable)}\n"
-        f"Текст: случайный вариант {variant_no + 1} из {len(messages_list)}\n"
-        f"Пауза: {delay} сек."
-    )
-
     client = TelegramClient(session_path, int(api_id), api_hash)
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
         await message.answer("Сессия не авторизована. Подключите аккаунт заново.")
         return
+
+    me = await client.get_me()
+    text = personalize_text(raw_text, me.username or "", me.first_name or "")
+    sender = f"@{me.username}" if me.username else (me.first_name or "без username")
+
+    await message.answer(
+        f"Рассылка запущена.\n"
+        f"Групп: {len(sendable)}\n"
+        f"Текст: случайный вариант {variant_no + 1} из {len(messages_list)}\n"
+        f"От имени: {sender}\n"
+        f"Пауза: {delay} сек."
+    )
 
     sent = blocked = slowmode = flood = errors_count = 0
     for idx, (tg_id, title, _) in enumerate(sendable, 1):
@@ -1180,6 +1190,7 @@ async def start_publish(message: Message, state: FSMContext):
     await state.set_state(PublishStates.confirm)
     await message.answer(
         f"Групп: {count}\n"
+        f"От имени: {('@' + account[5]) if account[5] else (account[6] or 'без username')}\n"
         f"Текст: случайный из {len(messages_list)}\n"
         f"Пауза: 10 сек.\n\nЗапустить?",
         reply_markup=confirm_keyboard(),
