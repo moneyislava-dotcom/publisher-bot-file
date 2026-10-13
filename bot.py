@@ -274,21 +274,12 @@ async def update_group_status(account_id, telegram_id, status, error=""):
 def manager_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="Запустить рассылку")],
             [
                 KeyboardButton(text="Подключить Telegram"),
                 KeyboardButton(text="Войти заново"),
             ],
-            [
-                KeyboardButton(text="Обновить группы"),
-                KeyboardButton(text="Мои группы"),
-            ],
-            [
-                KeyboardButton(text="Успешные группы"),
-                KeyboardButton(text="Моя статистика"),
-            ],
-            [KeyboardButton(text="Есть ответ")],
-            [KeyboardButton(text="Найти чаты")],
-            [KeyboardButton(text="Запустить рассылку")],
+            [KeyboardButton(text="Обновить группы")],
         ],
         resize_keyboard=True,
     )
